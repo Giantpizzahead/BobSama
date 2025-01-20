@@ -1,0 +1,10 @@
+google-genai
+python-dotenv
+opencv-python
+pyaudio
+pillow
+mss
+scipy
+discord.py
+discord-ext-voice-recv
+azure-cognitiveservices-speech
