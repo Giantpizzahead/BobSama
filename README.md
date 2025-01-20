@@ -1,6 +1,6 @@
 # BobSama
 
-Real-time Discord voice chatbot with screenshare interaction, low latency, and no-code setup.
+(WIP) Real-time voice chatbot with screenshare interaction, low latency, and no-code setup.
 
 ## Setup
 
