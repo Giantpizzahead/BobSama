@@ -1,10 +1,10 @@
 # BobSama
 
-Real-time voice chat bot with screenshare interaction, V-tuber model, captions, and no-code setup.
+Real-time Discord voice chatbot with screenshare interaction, low latency, and no-code setup.
 
 ## Setup
 
-Use **Python 3.12** in a virtual environment!
+Use **Python 3.12** in a virtual environment! You'll also need a `GOOGLE_API_KEY` in a `.env` file.
 
 ```sh
 # Make sure you are in a Python 3.12 virtual environment first

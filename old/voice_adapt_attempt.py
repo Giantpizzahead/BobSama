@@ -1,50 +1,45 @@
-"""
-Uses the Gemini 2.0 multimodal live API and auto-restarts before the session limit.
-Use headphones to avoid echos being detected as speech / interrupting the bot.
-"""
+"""Contains voice channel related functionality."""
 
-import asyncio
 import base64
 import io
+import sys
 import traceback
-import random
-from pynput import keyboard
+import asyncio
+import threading
 
+import cv2
 import wave
 import pyaudio
 import PIL.Image
 import mss
 import time
-import numpy as np
-from threading import Thread
 
 from google import genai
-from scipy.signal import resample, resample_poly
 
-from dotenv import load_dotenv
+import asyncio
+import os
+import platform
+from pathlib import Path
+from xml.sax.saxutils import escape
 
-load_dotenv()
+import azure.cognitiveservices.speech as speechsdk
+import discord
+import numpy as np
+from discord.ext import commands, voice_recv
+from scipy.signal import decimate, resample
 
+from discord_bot import bot
+from utils import get_logger, truncate_length
 
-
-
-# PUSH_TO_TALK_KEY = keyboard.KeyCode.from_char("v")
-PUSH_TO_TALK_KEY = keyboard.Key.alt_l
-# PUSH_TO_TALK_KEY = None
-
-CHECKIN_PROMPT = """Briefly make a playful or useful comment on what I am doing."""
-CHECKIN_LOWER_BOUND = 45
-CHECKIN_UPPER_BOUND = 90
-
-
-
+# ===== GOOGLE GEMINI =====
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
-TIMEOUT_DURATION = 480  # Seconds before the session should switch
+TIMEOUT_DURATION = 30  # Seconds before the session should switch
+# TIMEOUT_DURATION = 5
 
 MODEL = "models/gemini-2.0-flash-exp"
 TOOLS = [
@@ -54,40 +49,11 @@ TOOLS = [
 
 CONFIG = {
     "generation_config": {"response_modalities": ["AUDIO"]},
-    "system_instruction": "You are a user named BobSama chatting in a private Discord voice chat. You are a rising junior majoring in computer science at MIT and a playful teen who is a witty, kind, and empathetic gamer (great at League of Legends, you play mid and main Zoe, also a fan of rhythm games). If the user asks you about your life/gameplay, you should roleplay as if you also play the games they do. Avoid rambling for long, don't repeat yourself, bring up banter sometimes to keep conversations going, and be aware of sarcastic comments. You can refuse to answer a very inappropriate message by saying 'Filtered' exactly. Talk in a lighthearted tone.",
+    # "system_instruction": "",
     "tools": TOOLS,
 }
 
-SUMMARY_PROMPT = "Please provide a very concise summary of our conversation before this message. Do not include any follow up questions. Talk from the perspective of the user, calling me 'I said' and you 'Google said'. Start with 'Here is a summary of our conversation so far'. End with 'Now very briefly comment on what I am doing'."
-
-should_listen = PUSH_TO_TALK_KEY is None
-
-
-def on_press(evt):
-    # print(evt, "pressed")
-    global should_listen
-    try:
-        if evt == PUSH_TO_TALK_KEY and not should_listen:
-            should_listen = True
-            sound_thread = Thread(target=play_wav, args=("res/discord-ptt-on.wav",))
-            sound_thread.start()
-    except AttributeError:
-        pass
-
-def on_release(evt):
-    # print(evt, "released")
-    global should_listen
-    try:
-        if evt == PUSH_TO_TALK_KEY and should_listen:
-            should_listen = False
-            sound_thread = Thread(target=play_wav, args=("res/discord-ptt-off.wav",))
-            sound_thread.start()
-    except AttributeError:
-        pass
-
-
-listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-listener.start()
+SUMMARY_PROMPT = "Please provide a very concise summary of our conversation before this message. Do not include any follow up questions. Talk from the perspective of the user, calling me 'I said' and you 'Google said'. Start with 'Here is a summary of our conversation so far'. End with 'Now comment on something you see me doing'."
 
 
 def convert_audio_format(output_audio: bytes, input_rate: int, output_rate: int) -> bytes:
@@ -138,41 +104,6 @@ async def save_pcm_to_wav(pcm_data: bytes, filename: str, sample_rate: int, chan
     print(f"Saved WAV file as {filename}")
 
 
-def play_wav(file_path):
-    """
-    Plays a WAV file.
-
-    Parameters:
-        file_path (str): Path to the WAV file.
-    """
-    try:
-        # Open the WAV file
-        with wave.open(file_path, 'rb') as wf:
-            # Set up PyAudio
-            p = pyaudio.PyAudio()
-            stream = p.open(
-                format=p.get_format_from_width(wf.getsampwidth()),
-                channels=wf.getnchannels(),
-                rate=wf.getframerate(),
-                output=True
-            )
-
-            # Read and play chunks
-            chunk_size = 1024
-            data = wf.readframes(chunk_size)
-            while data:
-                stream.write(data)
-                data = wf.readframes(chunk_size)
-
-            # Clean up
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-
-    except Exception as e:
-        print(f"Error playing WAV file: {e}")
-
-
 class AudioLoop:
     def __init__(self, screen_share: bool = True):
         self.client = genai.Client(http_options={"api_version": "v1alpha"})
@@ -189,8 +120,8 @@ class AudioLoop:
         self.receive_audio_task = None
         self.play_audio_task = None
 
-        self.user_is_talking = False
-        self.bot_is_talking = False
+        self.is_listening = False
+        self.is_outputting = False
 
         self.is_migrating = False  # Whether we're switching to a new session
         self.migrating_event = asyncio.Event()  # Event for migration
@@ -198,17 +129,6 @@ class AudioLoop:
         self.audio_summary_queue = asyncio.Queue()
         self.num_frames = 0
         self.start_time = time.time()
-        self.next_checkin = time.time() + random.randint(CHECKIN_LOWER_BOUND, CHECKIN_UPPER_BOUND)
-
-    async def send_text(self):
-        while True:
-            text = await asyncio.to_thread(
-                input,
-                "Message > ",
-            )
-            if text.lower() == "q":
-                break
-            await self.session.send(input=text or ".", end_of_turn=True)
 
     def _get_screen(self):
         sct = mss.mss()
@@ -262,21 +182,8 @@ class AudioLoop:
             kwargs = {}
         # Sends an audio snippet every ~0.06 seconds
         while True:
-            if PUSH_TO_TALK_KEY:
-                self.user_is_talking = should_listen
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-            if not should_listen:  # Only capture audio when push-to-talk is active
-                # Make all the data zeros
-                data = b"\x00" * len(data)
             await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
-
-            # Check if it's time to send a check-in
-            if time.time() > self.next_checkin:
-                await self.session.send(input=CHECKIN_PROMPT, end_of_turn=True)
-                self.next_checkin = time.time() + random.randint(CHECKIN_LOWER_BOUND, CHECKIN_UPPER_BOUND)
-            elif self.user_is_talking or self.bot_is_talking:
-                self.next_checkin = time.time() + random.randint(CHECKIN_LOWER_BOUND, CHECKIN_UPPER_BOUND)
-                
 
     async def receive_audio(self):
         "Background task to reads from the websocket and write pcm chunks to the output queue"
@@ -287,9 +194,10 @@ class AudioLoop:
             async for response in turn:
                 if data := response.data:
                     had_data = True
-                    if not self.bot_is_talking:
-                        self.bot_is_talking = True
-                        # print(f"{self.bot_is_talking=}")
+                    self.is_outputting = True
+                    self.is_listening = False
+                    # print(f"{self.is_outputting=}")
+                    # print(f"{self.is_listening=}")
                     if self.is_migrating:
                         # Save summary audio for the next session
                         self.audio_summary_queue.put_nowait(data)
@@ -306,12 +214,11 @@ class AudioLoop:
                     # For interruptions to work, we need to stop playback.
                     # So empty out the audio queue because it may have loaded
                     # much more audio than has played yet.
-                    print("Bot interrupted")
+                    print("Interrupted")
                     had_data = False
                     include_silence = False
-                    if self.bot_is_talking:
-                        self.bot_is_talking = False
-                        # print(f"{self.bot_is_talking=}")
+                    self.is_listening = True
+                    # print(f"{self.is_listening=}")
                     while not self.audio_in_queue.empty():
                         self.audio_in_queue.get_nowait()
                     break
@@ -337,9 +244,8 @@ class AudioLoop:
             bytestream = await self.audio_in_queue.get()
             await asyncio.to_thread(stream.write, bytestream)
             if self.audio_in_queue.empty():
-                if self.bot_is_talking:
-                    self.bot_is_talking = False
-                    # print(f"{self.bot_is_talking=}")
+                self.is_outputting = False
+                # print(f"{self.is_outputting=}")
 
     async def run(self):
         try:
@@ -370,12 +276,15 @@ class AudioLoop:
             self.audio_stream.close()
             traceback.print_exception(EG)
 
+curr_gemini_session = None
 
-async def main():
+
+async def gemini_runner():
+    global curr_gemini_session
     # Initialize and run the bot
     curr_session = AudioLoop(screen_share=True)  # Set screen_share as needed
+    curr_gemini_session = curr_session
     curr_task = asyncio.create_task(curr_session.run())
-    print("BobSama is online!")
 
     while True:
         # Allow the session to run (or exit on error)
@@ -387,17 +296,13 @@ async def main():
 
         # TODO Wait for bot to be inactive (not talking, not interrupted)
         if curr_task in pending:
-            while curr_session.user_is_talking or curr_session.bot_is_talking:
-                await asyncio.sleep(0.01)
-        else:
-            # Bot quit on its own
-            print("Manual quit, exiting...")
-            break
+            pass
 
         # Create new session
         print("Creating new session...")
         new_session = AudioLoop(screen_share=True)
         new_task = asyncio.create_task(new_session.run())
+        curr_gemini_session = new_session
 
         # Generate summary
         curr_session.is_migrating = True
@@ -412,7 +317,7 @@ async def main():
         raw_audio_summary = b"".join(raw_audio_summary)
 
         # Convert summary to the correct PCM format
-        # print(len(raw_audio_summary))
+        print(len(raw_audio_summary))
         audio_summary = convert_audio_format(raw_audio_summary, SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
 
         # Feed summary to new session
@@ -431,7 +336,107 @@ async def main():
         # Switch the session
         curr_session = new_session
         curr_task = new_task
+    
+    curr_gemini_session = None
+
+if platform.system() == "Darwin":  # Manual load for Mac
+    discord.opus.load_opus("libopus.0.dylib")
+
+SPEECH_LOG_PATH = Path("local/speechsdk.log")
+Path(SPEECH_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+logger = get_logger(__name__)
+
+stt_conns: dict[int, bool] = {}  # Who is currently talking?
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def process_voice_packet(user: discord.Member, data: voice_recv.VoiceData) -> None:
+    """Process a voice packet from another user (?)."""
+    TARGET_BITRATE = 16000
+    try:
+        packet: voice_recv.rtp.AudioPacket = data.packet
+        channel: discord.VoiceChannel = user.voice.channel
+
+        # Check if audio is loud enough to initiate STT
+        power_level = packet.extension_data.get(voice_recv.ExtensionID.audio_power)
+        if power_level:
+            power_level = int.from_bytes(power_level, "big")
+            power_level = 127 - (power_level & 127)
+            if power_level < 80 and user.id not in stt_conns:
+                return  # Assume frivolous noise
+
+        if packet.is_silence():
+            # Stop the recognizer (if present) and close the stream
+            if user.id in stt_conns:
+                del stt_conns[user.id]
+            return
+
+        if user.id not in stt_conns:
+            stt_conns[user.id] = True
+        else:
+            stt_conns[user.id]
+
+        # Get PCM data and resample to 16 kHz
+        raw_pcm = np.frombuffer(data.pcm, dtype=np.int16)
+        orig_bitrate = channel.bitrate
+        # Check if the bitrate is a multiple of the target bitrate
+        if orig_bitrate % TARGET_BITRATE == 0:
+            resampled_pcm = decimate(raw_pcm, orig_bitrate // TARGET_BITRATE)
+        else:
+            # Fallback if not a multiple
+            num_samples = int(len(raw_pcm) * (TARGET_BITRATE / channel.bitrate))
+            resampled_pcm = resample(raw_pcm, num_samples)
+
+        # Convert back to bytes and write to Gemini stream
+        resampled_bytes = resampled_pcm.astype(np.int16).tobytes()
+        curr_gemini_session.audio_in_queue.put_nowait(resampled_bytes)
+    except Exception as e:
+        logger.exception(f"Error processing voice packet from {user.display_name}: {e}")
+
+
+@bot.hybrid_group(name="vc", fallback="join")
+async def join_vc(ctx: commands.Context) -> None:
+    """Tell Bob to join your voice channel."""
+    if ctx.author.voice is None:
+        await ctx.send("! but ur not in vc?")
+        return
+    elif ctx.voice_client is not None:
+        await ctx.send("! im already in vc?")
+        return
+    channel: discord.VoiceChannel = ctx.author.voice.channel
+
+    # Start Gemini
+    gemini_task = asyncio.create_task(gemini_runner())
+
+    # vc_histories[channel.id] = ManualHistory()
+    vc: voice_recv.VoiceRecvClient = await channel.connect(cls=voice_recv.VoiceRecvClient)
+    vc.listen(voice_recv.BasicSink(process_voice_packet))
+    await ctx.send(
+        "! hopping on :D\n\nTip: VC works best if you use push-to-talk. Speak without pausing, and let Bob finish."  # noqa: E501
+    )
+
+    # Handle messages and leave if VC is empty
+    while vc.is_connected() and len(vc.channel.members) > 1:
+        pass
+    if vc.is_connected():
+        await vc.disconnect()
+    
+    gemini_task.cancel()
+    try:
+        await gemini_task
+    except asyncio.CancelledError:
+        print("Gemini background task canceled.")
+
+
+@join_vc.command(name="leave")
+async def leave_vc(ctx: commands.Context) -> None:
+    """Tell Bob to leave your voice channel."""
+    if ctx.voice_client is None:
+        await ctx.send("! im not in vc?")
+        return
+    # Remove VC history (if it exists)
+    channel_id = ctx.voice_client.channel.id
+    # if channel_id in vc_histories:
+    #     del vc_histories[channel_id]
+    await ctx.voice_client.disconnect()
+    await ctx.send("! ok bye D:")

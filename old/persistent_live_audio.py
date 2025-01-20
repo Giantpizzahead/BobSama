@@ -293,10 +293,16 @@ async def main():
     curr_task = asyncio.create_task(curr_session.run())
 
     while True:
-        # Allow the session to run
-        await asyncio.sleep(TIMEOUT_DURATION)
+        # Allow the session to run (or exit on error)
+        done, pending = await asyncio.wait(
+            [curr_task], 
+            timeout=TIMEOUT_DURATION, 
+            return_when=asyncio.FIRST_COMPLETED
+        )
 
         # TODO Wait for bot to be inactive (not talking, not interrupted)
+        if curr_task in pending:
+            pass
 
         # Create new session
         print("Creating new session...")
