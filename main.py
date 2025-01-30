@@ -1,6 +1,6 @@
 """
 Uses the Gemini 2.0 multimodal live API and auto-restarts before the session limit.
-Use headphones to avoid echos being detected as speech / interrupting the bot.
+Use headphones or push-to-talk to avoid echos being detected as speech / interrupting the bot.
 """
 
 import asyncio
@@ -19,6 +19,11 @@ import numpy as np
 from threading import Thread
 
 from google import genai
+from google.genai.types import (
+    PrebuiltVoiceConfig,
+    SpeechConfig,
+    VoiceConfig,
+)
 from scipy.signal import resample, resample_poly
 
 from dotenv import load_dotenv
@@ -28,13 +33,21 @@ load_dotenv()
 
 
 
-# PUSH_TO_TALK_KEY = keyboard.KeyCode.from_char("v")
-PUSH_TO_TALK_KEY = keyboard.Key.alt_l
+# PUSH_TO_TALK_KEY = keyboard.KeyCode.from_char("c")
+PUSH_TO_TALK_KEY = keyboard.Key.ctrl_l
+# PUSH_TO_TALK_KEY = keyboard.Key.alt_l
 # PUSH_TO_TALK_KEY = None
 
 CHECKIN_PROMPT = """Briefly make a playful or useful comment on what I am doing."""
-CHECKIN_LOWER_BOUND = 45
-CHECKIN_UPPER_BOUND = 90
+
+# CHECKIN_PROMPT = """Briefly make a playful or useful comment on what I am doing. Do NOT try to initiate a new topic. For example, do the below things if appropriate.
+
+# If I'm in a game of League: If I previously asked you to track summoners or ultimates, remind me if it's still relevant. Otherwise, comment on the game state, then remind me to ping, call for objectives, and ward.
+
+# If I'm in a game of osu: If I passed or failed a beatmap, comment on that. Otherwise, comment on my accuracy, combo, or health.
+# """
+CHECKIN_LOWER_BOUND = 45 * 10000
+CHECKIN_UPPER_BOUND = 60 * 10000
 
 
 
@@ -44,7 +57,7 @@ CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
-TIMEOUT_DURATION = 10  # Seconds before the session should switch
+TIMEOUT_DURATION = 420  # Seconds before the session should switch
 
 MODEL = "models/gemini-2.0-flash-exp"
 TOOLS = [
@@ -54,11 +67,19 @@ TOOLS = [
 
 CONFIG = {
     "generation_config": {"response_modalities": ["AUDIO"]},
-    "system_instruction": "You are BobSama, chatting in a Discord voice chat with the user. You are a rising junior majoring in computer science at MIT and a playful teen who is a witty, kind, and empathetic gamer (great at League of Legends, you play mid and main Zoe, also a fan of rhythm games). If the user asks you about your life/gameplay, you should roleplay as if you also play the games they do. Avoid rambling for long, don't repeat yourself, bring up banter sometimes to keep conversations going, and be aware of sarcastic comments. You can refuse to answer a very inappropriate message by saying 'Filtered' exactly. Talk in a lighthearted tone. Note that the user is the one sharing their screen images, not you!",
+    "speech_config": SpeechConfig(
+        voice_config=VoiceConfig(
+            prebuilt_voice_config=PrebuiltVoiceConfig(
+                voice_name="Puck",
+                # voice_name="Aoede",
+            )
+        )
+    ),
+    "system_instruction": "You are BobSama, chatting in a Discord voice chat with the user. You are a rising junior majoring in computer science at MIT and a playfully toxic teen who is a witty, kind, and empathetic gamer. Bring up banter sometimes to keep conversations going, and be aware of sarcastic comments. You can refuse to answer a very inappropriate message by saying 'Filtered' exactly. Talk in a lighthearted tone. Note that the user is the one sharing their screen images, not you! Also, do not hallucinate answers - if you're not sure, search it up or say you don't know.",
     "tools": TOOLS,
 }
 
-SUMMARY_PROMPT = "Please provide a very concise summary of our conversation before this message. Do not include any follow up questions. Leave out portions that are no longer relevant. Talk from the perspective of the user, calling me 'I said' and you 'Google said'. Start with 'Here is a summary of our conversation so far'. End with 'Now very briefly comment on what I am doing'."
+SUMMARY_PROMPT = "Please provide a very concise summary of our conversation before this message. Do not include any follow up questions. Leave out portions that are old or no longer relevant to keep the summary to one short paragraph. Talk from the perspective of the user, calling me 'I said' and you 'BobSama said'. Start with 'Here is what we have talked about so far'. End with 'Do NOT repeat this summary or even mention it. Instead, very briefly comment on what I am currently doing.'."
 
 should_listen = PUSH_TO_TALK_KEY is None
 
@@ -239,6 +260,9 @@ class AudioLoop:
         image_io.seek(0)
 
         image_bytes = image_io.read()
+        image_io.close()
+        img.close()
+        sct.close()  # Prevents memory leak
         return {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}
 
     async def get_screen(self):
@@ -387,25 +411,52 @@ class AudioLoop:
             traceback.print_exception(EG)
 
 
+# # Memory usage tracking
+# import tracemalloc
+
+# tracemalloc.start()
+
+# async def debug_memory():
+#     i = 1
+#     while True:
+#         await asyncio.sleep(60)  # Check every 60 seconds
+#         snapshot = tracemalloc.take_snapshot()
+#         top_stats = snapshot.statistics('lineno')
+
+#         print(f"[Memory Debug {i}] Top 5 memory consumers:")
+#         for stat in top_stats[:5]:
+#             print(stat)
+        
+#         # Also save to file
+#         with open("memory_debug.txt", "a") as f:
+#             f.write(f"[Memory Debug {i}] Top 5 memory consumers:\n")
+#             for stat in top_stats[:5]:
+#                 f.write(f"{stat}\n")
+#         i += 1
+
+
 async def main():
+    # # Memory usage debugging
+    # asyncio.create_task(debug_memory())
+
     # Initialize and run the bot
     curr_session = AudioLoop(screen_share=True)  # Set screen_share as needed
     curr_task = asyncio.create_task(curr_session.run())
     print("BobSama is online!")
 
-    # If a summary exists, feed it in immediately
-    # Check if summary.wav exists
-    try:
-        with open("summary.wav", "rb") as f:
-            await asyncio.sleep(0.5)  # Wait for the bot to start
-            audio_summary = f.read()
-            print("Restoring previous summary...")
-            await curr_session.out_queue.put({"data": audio_summary, "mime_type": "audio/pcm"})
-            print("Done!")
-    except FileNotFoundError:
-        pass
-
     while True:
+        # If a summary exists, feed it in immediately
+        # Check if summary.wav exists
+        try:
+            with open("summary.wav", "rb") as f:
+                await asyncio.sleep(1)  # Wait for the bot to start
+                audio_summary = f.read()
+                print("Restoring previous summary...")
+                await curr_session.out_queue.put({"data": audio_summary, "mime_type": "audio/pcm"})
+                print("Done!")
+        except FileNotFoundError:
+            pass
+
         # Allow the session to run (or exit on error)
         done, pending = await asyncio.wait(
             [curr_task], 
@@ -420,8 +471,7 @@ async def main():
             curr_session.is_migrating = True
         else:
             # Bot quit on its own
-            print("Manual quit, exiting...")
-            break
+            print("Manual quit or error")
 
         # Create new session
         print("Creating new session...")
@@ -429,36 +479,38 @@ async def main():
         new_task = asyncio.create_task(new_session.run())
 
         # Generate summary
-        await curr_session.session.send(input=SUMMARY_PROMPT, end_of_turn=True)
-        await curr_session.migrating_event.wait()
-        print("Generated new summary...")
+        if curr_task in pending:
+            await curr_session.session.send(input=SUMMARY_PROMPT, end_of_turn=True)
+            await curr_session.migrating_event.wait()
+            print("Generated new summary...")
 
-        # Get full audio PCM
-        raw_audio_summary = []
-        while not curr_session.audio_summary_queue.empty():
-            raw_audio_summary.append(curr_session.audio_summary_queue.get_nowait())
-        raw_audio_summary = b"".join(raw_audio_summary)
-        print(f"Got summary of length {len(raw_audio_summary)}")
+            # Get full audio PCM
+            raw_audio_summary = []
+            while not curr_session.audio_summary_queue.empty():
+                raw_audio_summary.append(curr_session.audio_summary_queue.get_nowait())
+            raw_audio_summary = b"".join(raw_audio_summary)
+            print(f"Got summary of length {len(raw_audio_summary)}")
 
-        # Convert summary to the correct PCM format
-        audio_summary = convert_audio_format(raw_audio_summary, SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
+            # Convert summary to the correct PCM format
+            audio_summary = convert_audio_format(raw_audio_summary, SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
 
-        # Feed summary to new session
-        print("Converted summary")
-        await save_pcm_to_wav(audio_summary, "summary.wav", SEND_SAMPLE_RATE, CHANNELS, 2)
+            # Feed summary to new session
+            print("Converted summary")
+            await save_pcm_to_wav(audio_summary, "summary.wav", SEND_SAMPLE_RATE, CHANNELS, 2)
 
         # Wait for new session to be inactive
         print("Waiting for new session to be inactive...")
         while new_session.last_active + 2 > time.time():
             await asyncio.sleep(0.01)
-        print("Feeding summary to new session...")
-        await new_session.out_queue.put({"data": audio_summary, "mime_type": "audio/pcm"})
-        print("Done!")
+        # print("Feeding summary to new session...")
+        # await new_session.out_queue.put({"data": audio_summary, "mime_type": "audio/pcm"})
+        # print("Done!")
         
         # Cancel the old session gracefully
         curr_task.cancel()
         try:
             await curr_task
+            curr_session.audio_stream.close()
             print("Old session stopped (exited).")
         except asyncio.CancelledError:
             print("Old session stopped (cancelled).")
