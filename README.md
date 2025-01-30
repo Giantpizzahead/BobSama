@@ -1,6 +1,10 @@
 # BobSama
 
-Real-time Discord voice chatbot with screenshare interaction, low latency, and no-code setup.
+Version 0.1
+
+(WIP) Real-time voice chatbot with screenshare interaction, low latency, and no-code setup.
+
+Extends Gemini's [Multimodal Live API](https://ai.google.dev/api/multimodal-live) to provide a continuous, casual chat session.
 
 ## Setup
 
